@@ -22,6 +22,7 @@
 #include "dac.h"
 #include "dma.h"
 #include "i2c.h"
+#include "memorymap.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -81,6 +82,7 @@ int converted = 0;
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
 char *Float2String(float value);
 void calculate_hamming_window();
@@ -104,6 +106,9 @@ int main(void)
   /* USER CODE BEGIN 1 */
   calculate_hamming_window();
   /* USER CODE END 1 */
+
+  /* MPU Configuration--------------------------------------------------------*/
+  MPU_Config();
 
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -138,7 +143,12 @@ int main(void)
   kalman_filter_init(&phase_filter, 0.5, 0.1);
 
   AD9833_WaveSeting(110900.1,0,TRI_WAVE,0);
-  for (int i=0;i<=10;i++)AD9833_AmpSet(200); //设置幅值，幅值最大 255
+  for (int i=0;i<=10;i++)AD9833_AmpSet(255); //设置幅值，幅值最大 255 3.6vpp
+
+  for (int i=0; i<10; i++) {
+    HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_7);
+    // HAL_Delay(500);
+  }
 
   /* USER CODE END 2 */
 
@@ -308,6 +318,8 @@ float calc_slope_scan_f32(void)
 float global_DIV = 0;
 float freq_correction = 0;
 float last_freq_correction = 0;
+float sig1_amplitude = 0;
+float sig2_amplitude = 0;
 float last_freq = 0;
 int last_mode = 0;
 #define BASE_FREQ_LOW 0.0961538 // khz <=15k
@@ -328,22 +340,10 @@ void data_process() {
   for (int i = 0; i < ADC_BUFFER_SIZE; ++i) {
     fft_input_1_1[i*2] = hanning_win_table[i] * ((float32_t)adc_data_out[i*2] - sig_avg_1) / 65535.0f; // real part
     fft_input_1_1[i*2 + 1] = 0.0f; // imaginary part
-
-    // fft_input_1_2[i*2] = hanning_win_table[i] * ((float32_t)adc_data_out[i*2 + 1] - sig_avg_2) / 65535.0f; // real part
-    // fft_input_1_2[i*2 + 1] = 0.0f; // imaginary part
-
-    // fft_input_2_1[i*2] = hanning_win_table[i] * ((float32_t)adc_data_out[i*2 + ADC_BUFFER_SIZE] - sig_avg_1) / 65535.0f; // real part
-    // fft_input_2_1[i*2 + 1] = 0.0f; // imaginary part
-
-    // fft_input_2_2[i*2] = hanning_win_table[i] * ((float32_t)adc_data_out[i*2 + 1 + ADC_BUFFER_SIZE] - sig_avg_2) / 65535.0f; // real part
-    // fft_input_2_2[i*2 + 1] = 0.0f; // imaginary part
   }
 
   // perform fft
   arm_cfft_f32(&arm_cfft_sR_f32_len4096, fft_input_1_1, 0, 1);
-  // arm_cfft_f32(&arm_cfft_sR_f32_len4096, fft_input_2_2, 0, 1);
-  // arm_cfft_f32(&arm_cfft_sR_f32_len4096, fft_input_2_1, 0, 1);
-  // arm_cfft_f32(&arm_cfft_sR_f32_len4096, fft_input_2_2, 0, 1);
   arm_cmplx_mag_f32(fft_input_1_1 , magnitude_output , ADC_BUFFER_SIZE);
 
   // show magnitude
@@ -360,18 +360,16 @@ void data_process() {
   // find the peak frequency
   uint32_t peak_index;
   float32_t peak_value;
-  arm_max_f32(magnitude_output + 1, ADC_BUFFER_SIZE / 2 - 1, &peak_value, &peak_index);
-  peak_index += 1; // because we skipped the DC component
+  arm_max_f32(magnitude_output + 10, ADC_BUFFER_SIZE / 2 - 10, &peak_value, &peak_index);
+  peak_index += 10; // because we skipped the DC component
   char msg[30];
-  float freq;
+  static float freq1, freq2;
   if (peak_index < 160) {
-    freq = round(peak_index * BASE_FREQ_LOW * 10) / 10.0f;
-    // freq = peak_index * BASE_FREQ_LOW;
-    sniprintf(msg, sizeof(msg), "F1:%s kHz", Float2String(freq));
+    freq1 = round(peak_index * BASE_FREQ_LOW * 10) / 10.0f;
+    sniprintf(msg, sizeof(msg), "F1:%s kHz", Float2String(freq1));
   }else {
-    freq = round(peak_index * BASE_FREQ_HIGH * 10) / 10.0f;
-    // freq = peak_index * BASE_FREQ_HIGH;
-    sniprintf(msg, sizeof(msg), "F1:%s kHz", Float2String(freq));
+    freq1 = round(peak_index * BASE_FREQ_HIGH * 10) / 10.0f;
+    sniprintf(msg, sizeof(msg), "F1:%s kHz", Float2String(freq1));
   }
   OLED_PrintString(0, 0, msg, &font16x16, OLED_COLOR_NORMAL);
 
@@ -386,74 +384,27 @@ void data_process() {
   }
   OLED_PrintString(80, 0, msg, &font16x16, OLED_COLOR_NORMAL);
 
-  // sniprintf(msg, sizeof(msg), "div:%s", Float2String(global_DIV));
-  // OLED_PrintString(0,32, msg, &font16x16, OLED_COLOR_NORMAL);
-
-
-  float phase_1_1 = calculate_phase(0, 256, &arm_cfft_sR_f32_len256);
-  float phase_1_2 = calculate_phase(1, 256, &arm_cfft_sR_f32_len256);
-
-  if (phase_1_1 - phase_1_2 > 180) phase_1_2 += 360;
-  if (phase_1_2 - phase_1_1 > 180) phase_1_1 += 360;
-  float phase_diff = (phase_1_1 - phase_1_2);
-
-  for (int i = 1; i < HISTORY_SIZE; ++i) {
-    phase_history[i] = phase_history[i - 1];
-  }
-  phase_history[0] = phase_diff;
-  if (phase_diff > 170 && phase_history[1] < -165) {
-    for (int i = 1; i < HISTORY_SIZE; ++i) {
-      phase_history[i] += 360;
-    }
-  }
-  else if (phase_diff < -170 && phase_history[1] > 165) {
-    for (int i = 1; i < HISTORY_SIZE; ++i) {
-      phase_history[i] -= 360;
-    }
-  }
-  float k = calc_slope_scan_f32(); // 相位变化率
-
-  sniprintf(msg, sizeof(msg), "%d,%d\n", (int)(phase_diff*1000), (int)(k*1000));
-  HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
-
-  if (k > 0.2) {
-    freq_correction -= 0.0003 * freq / 10.f;
-  }
-  else if (k < -0.2) {
-    freq_correction += 0.0003 * freq / 10.f;
-    // test git
-  }
-
-
-  int mode;
-  switch (signal1_waveform_type) {
-    case 0: mode = SIN_WAVE; break;
-    case 1: mode = TRI_WAVE; break;
-    case 2: mode = SQU_WAVE; break;
-  }
-
-  const float p = 1000.026f;
-  static int correction_wait = 0;
-  if (freq * p != last_freq || mode != last_mode || (fabs(freq_correction - last_freq_correction)>0.0005 && correction_wait++ > 10)) {
-    AD9833_WaveSeting(freq * p + freq_correction,0,mode,0);
-    last_freq = freq * p;
-    last_mode = mode;
-    last_freq_correction = freq_correction;
-    correction_wait = 0;
-  }
+  sniprintf(msg, sizeof(msg), "div:%s", Float2String(global_DIV));
+  OLED_PrintString(0,32, msg, &font16x16, OLED_COLOR_NORMAL);
 
 
   // calculate the amplitude of the first signal
   const float fft_scaling_factor = 2.0f / ADC_BUFFER_SIZE * 2.0f / 1.5f;
-  const float amplitude_ratio[] = {1.0f, 1.2237f, 0.7754f}; // sine, ramp, square
+  const float amplitude_ratio[] = {0.9f, 1.2237f, 0.7754f}; // sine, ramp, square
   float32_t amplitude1 = 0;
   const int band = 5;
   for (int i = -band; i <= band; ++i) {
     amplitude1 += pow(magnitude_output[peak_index + i] * fft_scaling_factor, 2);
   }
   amplitude1 = sqrt(amplitude1) * amplitude_ratio[signal1_waveform_type] * 8.0f;
-  // sniprintf(msg, sizeof(msg), "A1:%s V", Float2String(amplitude1)); // 3.3V ref
-  // OLED_PrintString(0, 32, msg, &font16x16, OLED_COLOR_NORMAL);
+  if (signal1_waveform_type == 0 && amplitude1 < 1.0f)amplitude1 *= 1.23f;
+  else if (signal1_waveform_type == 0 && amplitude1 > 1.0f && amplitude1 < 2.0f)amplitude1 *= 1.1f;
+  else if (signal1_waveform_type == 0 && amplitude1 > 2.0f && amplitude1 < 3.0f)amplitude1 *= 1.05f;
+  else if (signal1_waveform_type == 1 && amplitude1 < 1.0f)amplitude1 *= 1.05f;
+  else if (signal1_waveform_type == 2 && amplitude1 < 1.0f)amplitude1 *= 1.15f;
+  sig1_amplitude = amplitude1;
+  sniprintf(msg, sizeof(msg), "A1:%s", Float2String(amplitude1)); // 3.3V ref
+  OLED_PrintString(0, 48, msg, &font16x16, OLED_COLOR_NORMAL);
 
 
   // eliminate the first signal
@@ -477,11 +428,13 @@ void data_process() {
   // find the peak frequency
   uint32_t peak_index2;
   float32_t peak_value2;
-  arm_max_f32(magnitude_output + 1, ADC_BUFFER_SIZE / 2 - 1, &peak_value2, &peak_index2);
-  peak_index2 += 1; // because we skipped the DC component
+  arm_max_f32(magnitude_output + 10, ADC_BUFFER_SIZE / 2 - 10, &peak_value2, &peak_index2);
+  peak_index2 += 10; // because we skipped the DC component
   if (peak_index2 < 160) {
+    freq2 = round(peak_index2 * BASE_FREQ_LOW * 10) / 10.0f;
     sniprintf(msg, sizeof(msg), "F2:%s kHz", Float2String(peak_index2 * BASE_FREQ_LOW));
   }else {
+    freq2 = round(peak_index2 * BASE_FREQ_HIGH * 10) / 10.0f;
     sniprintf(msg, sizeof(msg), "F2:%s kHz", Float2String(peak_index2 * BASE_FREQ_HIGH));
   }
   OLED_PrintString(0, 16, msg, &font16x16, OLED_COLOR_NORMAL);
@@ -500,11 +453,54 @@ void data_process() {
   // calculate the amplitude of the second signal
   float32_t amplitude2 = 0;
   for (int i = -band; i <= band; ++i) {
-    amplitude2 += pow(magnitude_output[peak_index2 + i], 2);
+    amplitude2 += pow(magnitude_output[peak_index2 + i] * fft_scaling_factor, 2);
   }
-  amplitude2 = sqrt(amplitude2) * amplitude_ratio[signal2_waveform_type] / 65536.0f * 3.3f;
-  sniprintf(msg, sizeof(msg), "A2:%s V", Float2String(amplitude2)); // 3.3V ref
-  // OLED_PrintString(64, 32, msg, &font16x16, OLED_COLOR_NORMAL);
+  amplitude2 = sqrt(amplitude2) * amplitude_ratio[signal2_waveform_type] * 9.0f;
+  if (signal2_waveform_type == 0 && amplitude2 < 1.0f)amplitude1 *= 1.23f;
+  else if (signal2_waveform_type == 0 && amplitude2 > 1.0f && amplitude1 < 2.0f)amplitude2 *= 1.1f;
+  else if (signal2_waveform_type == 0 && amplitude2 > 2.0f && amplitude2 < 3.0f)amplitude2 *= 1.05f;
+  else if (signal2_waveform_type == 1 && amplitude2 < 1.0f)amplitude2 *= 1.05f;
+  else if (signal2_waveform_type == 2 && amplitude2 < 1.0f)amplitude2 *= 1.15f;
+  sig2_amplitude = amplitude2;
+  sniprintf(msg, sizeof(msg), "A2:%s", Float2String(amplitude2)); // 3.3V ref
+  OLED_PrintString(64, 32, msg, &font16x16, OLED_COLOR_NORMAL);
+
+
+
+  static float freq, amp;
+  int waveform_type;
+
+  if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_4) == GPIO_PIN_SET) {
+    freq = freq1;
+    amp = sig1_amplitude;
+    waveform_type = signal1_waveform_type;
+    sprintf(msg, "CH1");
+    OLED_PrintString(80, 48, msg, &font16x16, OLED_COLOR_NORMAL);
+  }
+  else {
+    freq = freq2;
+    amp = sig2_amplitude;
+    waveform_type = signal2_waveform_type;
+    sprintf(msg, "CH2");
+    OLED_PrintString(80, 48, msg, &font16x16, OLED_COLOR_NORMAL);
+  }
+
+  int mode;
+  switch (waveform_type) {
+    case 0: mode = SIN_WAVE; break;
+    case 1: mode = TRI_WAVE; break;
+    case 2: mode = SQU_WAVE; break;
+  }
+
+  const float p = 1000.026f;
+  if (freq * p != last_freq || mode != last_mode) {
+    AD9833_WaveSeting(freq * p + freq_correction,0,mode,0);
+    AD9833_AmpSet((int)(255.f/3.6f * amp));
+    last_freq = freq * p;
+    last_mode = mode;
+  }
+
+
 
 }
 
@@ -536,9 +532,9 @@ int detect_wareform_type(uint32_t base_idx) {
   int waveform_type = 0; // 0: sine, 1: ramp, 2: square
   float DIV = fund_energy / first_harmonic_energy;
   global_DIV = DIV;
-  if (DIV < 5 && DIV > 1) {
+  if (DIV > 1 && DIV < 5.5) {
     waveform_type = 2;
-  } else if (DIV < 16 && DIV > 6) {
+  } else if (DIV > 5.5 && DIV < 16) {
     waveform_type = 1;
   } else {
     waveform_type = 0;
@@ -630,6 +626,35 @@ float calculate_phase(int offset, int fft_size, const arm_cfft_instance_f32 * S)
 // }
 
 /* USER CODE END 4 */
+
+ /* MPU Configuration */
+
+void MPU_Config(void)
+{
+  MPU_Region_InitTypeDef MPU_InitStruct = {0};
+
+  /* Disables the MPU */
+  HAL_MPU_Disable();
+
+  /** Initializes and configures the Region and the memory to be protected
+  */
+  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
+  MPU_InitStruct.Number = MPU_REGION_NUMBER0;
+  MPU_InitStruct.BaseAddress = 0x0;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
+  MPU_InitStruct.SubRegionDisable = 0x87;
+  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
+  MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
+  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
+  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+
+  HAL_MPU_ConfigRegion(&MPU_InitStruct);
+  /* Enables the MPU */
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
